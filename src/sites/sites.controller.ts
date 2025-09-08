@@ -1,7 +1,13 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Put } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, InternalServerErrorException, NotFoundException, Param, Patch, Post, Put, Res, UploadedFile, UseInterceptors } from '@nestjs/common';
 import { Site } from 'src/entities/site.entity';
 import { SitesService } from './sites.service';
 import { CreateSiteTableDto } from 'src/DTOs/CreateTableColumnDTO';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage } from 'multer';
+import type { Response } from 'express';
+import * as path from 'path';
+import * as fs from 'fs';
+
 
 interface ColumnDto {
     name: string;
@@ -153,5 +159,103 @@ export class SitesController {
     ) {
         return this.sitesService.updateSiteTable(siteId, tableName, dto.tableName, dto.columns);
     }
+
+
+
+
+    @Post("/image/:id/:table_id")
+    @UseInterceptors(
+        FileInterceptor('image', {
+            storage: diskStorage({
+                destination: './public/images',
+                filename: (req, file, callback) => {
+                    // Substitui espaços e caracteres problemáticos no nome do arquivo
+                    const safeName = file.originalname.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9.-]/g, '');
+                    const filename = `${Date.now()}-${safeName}`;
+                    callback(null, filename);
+                },
+            }),
+            fileFilter: (req, file, callback) => {
+                // Aceita apenas imagens PNG, JPG, JPEG, GIF ou WebP
+                if (/image\/(png|jpeg|jpg|gif|webp)/.test(file.mimetype)) {
+                    callback(null, true);
+                } else {
+                    callback(new BadRequestException('Apenas imagens são permitidas'), false);
+                }
+            },
+            limits: { fileSize: 5 * 1024 * 1024 }, // Limite de 5MB
+        }),
+    )
+    async uploadFile(
+        @UploadedFile() file: Express.Multer.File,
+        @Param("id") id: number,
+        @Param("table_id") table_id: string,
+    ) {
+        if (!file) {
+            throw new NotFoundException('Nenhuma imagem foi enviada');
+        }
+
+        console.log('Arquivo recebido:', file);
+
+        try {
+            const filename = await this.sitesService.saveFile(file, table_id, +id);
+            return { message: 'Imagem carregada com sucesso!', filename };
+        } catch (error) {
+            console.error('Erro ao salvar a imagem:', error);
+            throw new InternalServerErrorException('Erro ao salvar a imagem');
+        }
+    }
+
+
+    @Get('/image/:id/:table_id')
+    async getImage(
+        @Param('id') id: number,
+        @Param('table_id') table_id: string,
+        @Res() res: Response,
+    ) {
+        try {
+            const filename = await this.sitesService.getFile(table_id, id);
+
+            if (!filename) {
+                throw new NotFoundException('Imagem não encontrada');
+            }
+
+            const filePath = path.join(
+                process.cwd(),
+                'public/images',
+                filename,
+            );
+
+            if (!fs.existsSync(filePath)) {
+                throw new NotFoundException('Arquivo físico não encontrado');
+            }
+
+            return res.sendFile(filePath);
+        } catch (error) {
+            console.error('Erro ao buscar a imagem:', error);
+            throw new NotFoundException('Erro ao buscar a imagem');
+        }
+    }
+
+
+    @Delete('/image/:id/:table_id')
+    async deleteImage(
+        @Param('id') id: number,
+        @Param('table_id') table_id: string,
+    ) {
+        try {
+            const deleted = await this.sitesService.deleteFile(table_id, id);
+
+            if (!deleted) {
+                throw new NotFoundException('Imagem não encontrada');
+            }
+
+            return { message: 'Imagem apagada com sucesso' };
+        } catch (error) {
+            console.error('Erro ao apagar a imagem:', error);
+            throw new NotFoundException('Erro ao apagar a imagem');
+        }
+    }
+
 }
 

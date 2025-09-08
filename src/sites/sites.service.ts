@@ -6,6 +6,10 @@ import { SitesTabelas } from 'src/entities/sites-tabelas.entity';
 import { ChangesGateway } from 'src/Gateway/updates.gateway';
 import { DataSource, Raw, Repository } from 'typeorm';
 import { ulid } from 'ulid';
+import * as bcrypt from 'bcrypt';
+import * as path from 'path';
+import * as fs from 'fs';
+
 function normalizeColumnName(name: string) {
     return name
         .toLowerCase()
@@ -24,6 +28,8 @@ interface ColumnDto {
 }
 @Injectable()
 export class SitesService {
+    private uploadPath = './public/images';
+
 
 
 
@@ -66,33 +72,44 @@ export class SitesService {
         tableName: string,
         columns: { name: string; type: string; notNull?: boolean }[]
     ) {
-        // Normaliza os nomes das colunas
-        const columnsSql = columns
+        // Remove colunas do tipo IMAGEM (não existem no MySQL)
+        const filteredColumns = columns.filter(c => c.type.toUpperCase() !== 'IMAGEM');
+
+        // Normaliza os nomes das colunas e cria SQL
+        let columnsSql = filteredColumns
             .map(c => `${normalizeColumnName(c.name)} ${c.type}${c.notNull ? ' NOT NULL' : ''}`)
             .join(',\n        ');
+
+        // Verifica se havia uma coluna do tipo IMAGEM
+        const hasImageColumn = columns.some(c => c.type.toUpperCase() === 'IMAGEM');
+        if (hasImageColumn) {
+            // Adiciona automaticamente o campo image_id
+            columnsSql += `,\n        image_id VARCHAR(255) NULL`;
+        }
 
         // Gera um table_id único
         const tableId = generateTableId();
 
-        // Cria o SQL usando o table_id como nome real da tabela no banco
+        // Cria a tabela no MySQL
         const sql = `
-            CREATE TABLE IF NOT EXISTS ${tableId} (
-                id INT NOT NULL AUTO_INCREMENT,
-                ${columnsSql},
-                PRIMARY KEY(id)
-            )
-        `;
+        CREATE TABLE IF NOT EXISTS \`${tableId}\` (
+            id INT NOT NULL AUTO_INCREMENT,
+            ${columnsSql},
+            PRIMARY KEY(id)
+        )
+    `;
 
-        // Executa o SQL no banco
         await this.dataSource.query(sql);
 
-        // Salva na tabela de metadados
+        // Salva metadados
         const st = this.sitesTabelasRepository.create({
             site_id: siteId,
             table_name: tableName, // apenas para exibição
-            table_id: tableId, // nome real da tabela no banco
+            table_id: tableId,     // nome real da tabela no banco
         });
-        this.changesGateway.sendSiteAltered(siteId)
+
+        this.changesGateway.sendSiteAltered(siteId);
+
         return this.sitesTabelasRepository.save(st);
     }
 
@@ -107,6 +124,7 @@ export class SitesService {
         id: number,
         data: Record<string, any>,
     ) {
+        console.log("aqui", data);
         if (siteId !== 0) {
             await this.validateTable(siteId, tableName);
         }
@@ -117,6 +135,7 @@ export class SitesService {
         const setClauses = Object.entries(filteredData)
             .map(([col, val]) => `\`${col}\` = ${val === '' ? 'NULL' : `'${val}'`}`)
             .join(', ');
+
 
         const sql = `UPDATE ${tableName} SET ${setClauses} WHERE id = ${id}`;
         await this.dataSource.query(sql);
@@ -147,31 +166,29 @@ export class SitesService {
     async createTableRecord(siteId: number, tableName: string, data: Record<string, any>) {
         if (siteId !== 0) {
             await this.validateTable(siteId, tableName);
-
         }
-
-        // Garante que o id auto_increment não seja enviado
+        console.log("data", data);
         const filteredData = { ...data };
         delete filteredData.id;
-
 
         const columns = Object.keys(filteredData)
             .map((col) => `\`${col}\``)
             .join(', ');
+
         const values = Object.values(filteredData)
             .map((val) => (val === '' ? 'NULL' : `'${val}'`))
-            .join(', ');
+            .join(',');
 
+        await this.dataSource.query(`INSERT INTO \`${tableName}\` (${columns}) VALUES (${values})`);
 
+        // Retorna o ID do registro recém-criado
+        const [result] = await this.dataSource.query('SELECT LAST_INSERT_ID() as id');
+        const newId = result.id;
 
+        this.changesGateway.sendTableAltered(tableName, siteId);
 
-        const sql = `INSERT INTO ${tableName} (${columns}) VALUES (${values})`;
-        await this.dataSource.query(sql);
-        this.changesGateway.sendTableAltered(tableName, siteId)
-
-        return { message: 'Registro criado com sucesso!' };
+        return { message: 'Registro criado com sucesso!', id: newId };
     }
-
 
 
 
@@ -420,19 +437,17 @@ export class SitesService {
         return { message: `Registro de id ${id} na tabela ${table_id} deletado com sucesso` };
     }
 
-
     async updateSiteTable(
         siteId: number,
-        tableName: string,        // Nome atual da tabela no banco (table_id)
-        newName: string | undefined, // Novo nome para a tabela, se quiser renomear
-        columns: ColumnDto[],     // Colunas que o usuário quer manter/alterar
+        tableName: string,           // Nome atual da tabela no banco
+        newName: string | undefined, // Novo nome da tabela, se quiser renomear
+        columns: ColumnDto[],        // Colunas que o usuário quer manter/alterar
     ) {
         // Valida se a tabela existe
         await this.validateTable(siteId, tableName);
+        console.log("Atualizando tabela", tableName, "do site", siteId, "com colunas:", columns);
 
         // 1️⃣ Renomear a tabela se necessário
-
-        // Atualiza também o metadata na tabela SitesTabelas
         const tableAssoc = await this.sitesTabelasRepository.findOne({
             where: { site_id: siteId, table_id: tableName },
         });
@@ -442,41 +457,151 @@ export class SitesService {
         }
 
         // 2️⃣ Buscar estrutura atual da tabela
-        const existingColumns: { Field: string; Type: string; Null: string }[] = await this.dataSource.query(
-            `DESCRIBE \`${tableName}\``
-        );
+        const existingColumns: { Field: string; Type: string; Null: string }[] =
+            await this.dataSource.query(`DESCRIBE \`${tableName}\``);
 
         // 3️⃣ Atualizar ou adicionar colunas
         for (const col of columns) {
             if (col.name.toLowerCase() === 'id') continue; // nunca mexer no ID
-            const existing = existingColumns.find(e => e.Field === col.name);
 
+            // Se for IMAGEM, o nome no banco será image_id
+            const columnNameInDb = col.type.toUpperCase() === 'IMAGEM' ? 'image_id' : col.name;
+
+            const existing = existingColumns.find(e => e.Field === columnNameInDb);
             const nullStr = col.notNull ? 'NOT NULL' : 'NULL';
-            const colType = col.type.toUpperCase();
+
+            // Mapeia IMAGEM para VARCHAR(255)
+            const colType = col.type.toUpperCase() === 'IMAGEM' ? 'VARCHAR(255)' : col.type.toUpperCase();
 
             if (existing) {
                 // ALTERA coluna existente
                 await this.dataSource.query(
-                    `ALTER TABLE \`${tableName}\` MODIFY COLUMN \`${col.name}\` ${colType} ${nullStr}`
+                    `ALTER TABLE \`${tableName}\` MODIFY COLUMN \`${columnNameInDb}\` ${colType} ${nullStr}`
                 );
             } else {
                 // ADICIONA coluna nova
                 await this.dataSource.query(
-                    `ALTER TABLE \`${tableName}\` ADD COLUMN \`${col.name}\` ${colType} ${nullStr}`
+                    `ALTER TABLE \`${tableName}\` ADD COLUMN \`${columnNameInDb}\` ${colType} ${nullStr}`
                 );
             }
         }
 
-        // 4️⃣ Opcional: remover colunas não incluídas na lista (exceto id)
-        const columnNamesToKeep = columns.map(c => c.name.toLowerCase());
+        // 4️⃣ Remover colunas não incluídas na lista (exceto id)
+        const columnNamesToKeep = columns.map(c =>
+            c.type.toUpperCase() === 'IMAGEM' ? 'image_id' : c.name.toLowerCase()
+        );
         for (const existing of existingColumns) {
             if (existing.Field.toLowerCase() !== 'id' && !columnNamesToKeep.includes(existing.Field.toLowerCase())) {
-                await this.dataSource.query(`ALTER TABLE \`${tableName}\` DROP COLUMN \`${existing.Field}\``);
+                await this.dataSource.query(
+                    `ALTER TABLE \`${tableName}\` DROP COLUMN \`${existing.Field}\``
+                );
             }
         }
-        this.changesGateway.sendTableAltered(tableName, siteId)
+
+        // Notifica alterações
+        this.changesGateway.sendTableAltered(tableName, siteId);
+
         return { message: `Tabela "${tableName}" atualizada com sucesso!` };
     }
 
+
+    async saveFile(file: Express.Multer.File, table_id: string, id: number) {
+        try {
+            const tableAssoc = await this.sitesTabelasRepository.findOne({
+                where: { table_id },
+            });
+            console.log("tableAssoc", tableAssoc);
+
+            if (!tableAssoc) {
+                throw new Error(`Tabela com ID ${table_id} não encontrada`);
+            }
+
+            // Busca o registo pelo id
+            const [record] = await this.dataSource.query(
+                `SELECT * FROM \`${table_id}\` WHERE id = ? LIMIT 1`,
+                [id],
+            );
+
+            if (!record) {
+                throw new Error(`Registo com id=${id} não encontrado na tabela ${table_id}`);
+            }
+
+            // Apaga imagem antiga (se existir)
+            if (record.image_id) {
+                const oldPath = path.join(this.uploadPath, record.image_id);
+                try {
+                    await fs.promises.unlink(oldPath);
+                    console.log(`Imagem antiga ${record.image_id} apagada com sucesso`);
+                } catch (err) {
+                    console.warn(`Não foi possível apagar imagem antiga: ${err.message}`);
+                }
+            }
+
+            // Atualiza o campo image_id
+            await this.dataSource.query(
+                `UPDATE \`${table_id}\` SET image_id = ? WHERE id = ?`,
+                [file.filename, id],
+            );
+
+            return file.filename;
+        } catch (error) {
+            console.error("Erro ao salvar a imagem:", error);
+            throw new Error("Erro ao salvar a imagem");
+        }
+    }
+
+    async getFile(table_id: string, id: number): Promise<string | null> {
+        try {
+            const [user] = await this.dataSource.query(
+                `SELECT image_id FROM \`${table_id}\` WHERE id = ? LIMIT 1`,
+                [id],
+            );
+
+            if (!user || !user.image_id) {
+                return null;
+            }
+
+            return user.image_id;
+        } catch (error) {
+            console.error('Erro ao buscar imagem no banco:', error);
+            return null;
+        }
+    }
+    async deleteFile(table_id: string, id: number): Promise<boolean> {
+        try {
+            // 1️⃣ Buscar imagem no registo
+            const [user] = await this.dataSource.query(
+                `SELECT image_id FROM \`${table_id}\` WHERE id = ? LIMIT 1`,
+                [id],
+            );
+
+            if (!user || !user.image_id) {
+                return false;
+            }
+
+            const imagePath = path.join(
+                process.cwd(),
+                'public/images',
+                user.image_id,
+            );
+
+            // 2️⃣ Apagar ficheiro físico
+            if (fs.existsSync(imagePath)) {
+                await fs.promises.unlink(imagePath);
+                console.log(`Imagem ${user.image_id} apagada do disco`);
+            }
+
+            // 3️⃣ Limpar campo no DB
+            await this.dataSource.query(
+                `UPDATE \`${table_id}\` SET image_id = NULL WHERE id = ?`,
+                [id],
+            );
+
+            return true;
+        } catch (error) {
+            console.error('Erro ao apagar imagem no banco:', error);
+            return false;
+        }
+    }
 
 }
